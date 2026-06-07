@@ -1,0 +1,147 @@
+diff --git a/arch-arm/entry.sx b/arch-arm/entry.sx
+index 6f683b6..df15e33 100644
+--- a/arch-arm/entry.sx
++++ b/arch-arm/entry.sx
+@@ -42,6 +42,52 @@ _start:
+ .code 32
+ ArmReset:						// This function will setup the processor and kick off execution
+ 
++	// === ROBUST ENTRY SHIM (v26) ===
++	// Take over the machine from the chainloader (kloader) regardless of the MMU/
++	// cache state it left, with deterministic physical addressing.
++	CPSID	if					// mask IRQ + FIQ
++	// 1. Clean the ENTIRE D-cache to RAM *while it is still enabled*, so any dirty
++	//    lines (e.g. the image kloader copied in, if its flush was incomplete) reach
++	//    main memory before we turn the cache off. A8 set/way clean (DCCSW).
++	MOV	R2, #0x2000
++ShimClean_1:
++	SUB	R2, R2, #0x40
++	MOV	R1, #0
++ShimClean_2:
++	SUBS	R1, R1, #0x40000000
++	ORR	R0, R1, R2
++	MCR	p15, 0, R0, c7, c10, 2			// clean D-cache line by set/way
++	BNE	ShimClean_2
++	CMP	R2, #0
++	BNE	ShimClean_1
++	MCR	p15, 0, R0, c7, c10, 4			// DSB - ensure cleans complete
++	// 2. Disable MMU + caches.
++	MRC	p15, 0, R0, c1, c0, 0			// read SCTLR
++	BIC	R0, R0, #0x1				// clear M  (MMU)
++	BIC	R0, R0, #0x4				// clear C  (D-cache)
++	BIC	R0, R0, #0x1000				// clear I  (I-cache)
++	MCR	p15, 0, R0, c1, c0, 0			// write SCTLR
++	// 3. Invalidate TLB / I-cache / branch predictor, then barriers.
++	MOV	R0, #0
++	MCR	p15, 0, R0, c8, c7, 0			// TLBIALL
++	MCR	p15, 0, R0, c7, c5, 0			// ICIALLU
++	MCR	p15, 0, R0, c7, c5, 6			// BPIALL
++	MCR	p15, 0, R0, c7, c10, 4			// DSB
++	MCR	p15, 0, R0, c7, c5, 4			// ISB (prefetch flush)
++
++	// 4. DISARM the S5L8920 hardware watchdog that iBoot left armed across the
++	//    kloader sleep/wake handoff. openiboot's own Reboot/DebugReboot FIRE a reset
++	//    via 0xBF100214=1, 0xBF100210=0x80000000, 0xBF10021C=4; we DISARM by zeroing
++	//    enable/count/control. MMU is now OFF, so these are correct physical writes.
++	//    R0 is still 0 from the cache ops above.
++	LDR	R1, =0xBF10021C
++	STR	R0, [R1]				// control/commit = 0
++	LDR	R1, =0xBF100214
++	STR	R0, [R1]				// enable = 0
++	LDR	R1, =0xBF100210
++	STR	R0, [R1]				// count/timeout = 0
++	// === END ROBUST ENTRY SHIM ===
++
+ 	MOV	R0, PC
+ 	LDR	R1, =ArmResetDifferenceFromEntry
+ 	SUB	R0, R0,	R1
+diff --git a/init.c b/init.c
+index baed83d..94c8838 100644
+--- a/init.c
++++ b/init.c
+@@ -43,14 +43,23 @@ void init_boot_modules()
+ 	if(init_boot_done)
+ 		return;
+ 
+-	init_boot_done = TRUE;	
++	init_boot_done = TRUE;
+ 
+ 	bufferPrintf("init: Initializing boot modules.\n");
+ 
++	// === BLIND-BRINGUP DIAG v19 ===
++	// Boot-init order (from ELF .init_modules_boot): 0=audiohw_init, 1=setup_init,
++	// 2=nor_init. Halt BEFORE calling index DIAG_BOOT_N. HANG => indices < N survived,
++	// reset is at index N or later. REBOOT => reset is at an index < N.
++	#define DIAG_BOOT_N 0
++	int diag_n = 0;
++	// === END DIAG v19 ===
++
+ 	initfn_t *fn = &init_boot_init;
+ 	fn++;
+ 	while(*fn)
+ 	{
++		if (diag_n++ == DIAG_BOOT_N) { for (;;) { } }
+ 		(*fn)();
+ 		fn++;
+ 	}
+diff --git a/openiboot.c b/openiboot.c
+index 8536b33..ac86254 100644
+--- a/openiboot.c
++++ b/openiboot.c
+@@ -44,6 +44,28 @@ void OpenIBootConsole()
+ 
+ void OpenIBootStart()
+ {
++	// === BLIND-BRINGUP DIAG v24: paint the live framebuffer white ===
++	// The CLCD scanout address register is CLCD_BASE(0x85400000)+0x24 (see
++	// createWindow() in plat-s5l8920/clcd.c). When kloader hands off, iOS left this
++	// pointing at its live framebuffer and the controller is still scanning it.
++	// Read that address; if it's sane RAM, fill it white. The display keeps scanning,
++	// so a clean run turns the screen WHITE -- a positive, retry-able sign of life
++	// that doesn't depend on the noisy hang-vs-reboot signal. Runs before
++	// platform_init() so MMU/clocks/display are exactly as iOS left them. Only writes
++	// if the address is in RAM, so it's safe even if CLCD_BASE is a stale constant.
++	{
++		volatile uint32_t *clcd_fb_reg = (volatile uint32_t*)(0x85400000 + 0x24);
++		uint32_t fb = *clcd_fb_reg;
++		if (fb >= 0x40000000 && fb < 0x50000000) {
++			volatile uint32_t *p = (volatile uint32_t*)fb;
++			unsigned int i;
++			for (i = 0; i < 320u*480u; i++)
++				p[i] = 0xFFFFFFFF;
++		}
++	}
++	for (;;) { }
++	// === END DIAG v24 ===
++
+ 	platform_init();
+ 	init_setup();
+ 
+diff --git a/plat-s5l8920/s5l8920.c b/plat-s5l8920/s5l8920.c
+index 96f21fb..4b972e8 100644
+--- a/plat-s5l8920/s5l8920.c
++++ b/plat-s5l8920/s5l8920.c
+@@ -47,11 +47,20 @@ void platform_init()
+ 	// Other devices
+ 	dma_setup();
+ 	//usb_shutdown();
+-	uart_setup();
++	// BISECT RESULT: uart_setup() triggers a SoC reset on 8920 (likely stale UART1-4
++	// base addresses @ 1MB spacing from 0x82500000, plus a div-by-zero from
++	// sample_rate=0 on the first uart_set_baud_rate). UART is only serial debug, so
++	// skip it. -- v8
++	//uart_setup();
+ 	i2c_setup();
+-	spi_setup();
++	// BISECT RESULT: spi_setup() also triggers a SoC reset on 8920 (same class of
++	// stale-hardware-constant bug as uart). SPI (NOR flash) isn't needed to bring up
++	// openiboot, so skip it. -- v16
++	//spi_setup();
+ 
+-	LeaveCriticalSection();
++	// DIAG v23: keep IRQs disabled through bringup to test if a spurious IRQ (via
++	// bufferPrintf's Enter/LeaveCriticalSection toggle) is the reset source.
++	//LeaveCriticalSection();
+ 
+ 	aes_setup();
+ }
