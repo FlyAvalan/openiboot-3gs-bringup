@@ -86,10 +86,18 @@ watchdog that iBoot armed and openiboot never disables or pets.
   (proven by openiboot's own `Reboot`/`DebugReboot`, which *fire* a reset via
   `0x214=1, 0x210=0x80000000, 0x21C=4`). The A4 sibling uses the analogous
   `0xBF102020/2024/202C`.
-- Simply zeroing those three registers at entry did **not** stop the ~2-min reset, so
-  either that block is only a write-to-fire trigger (not the running counter) or the
-  disable needs a different bit/sequence — or the ~2-min watchdog is the **PMU** (I2C).
-  *(Open — under investigation.)*
+- It's the Apple **"WD1" SoC watchdog** (WDx group, base `0xBF100200`): `+0x10` CUR_TIME
+  (free-running 24 MHz up-counter), `+0x14` BITE_TIME (timeout compare), `+0x1C` CTRL
+  with **RESET_EN = bit 2**. A reset fires iff `RESET_EN` is set **and**
+  `CUR_TIME ≥ BITE_TIME` — the same register map/semantics as Linux mainline
+  `drivers/watchdog/apple_wdt.c`. iBoot arms it with ~120 s BITE_TIME before handoff.
+- **Disable (verified):** write **`0` to WD1_CTRL (`0xBF10021C`)** to clear RESET_EN
+  (this is exactly `apple_wdt_stop`). Two gotchas that defeated a first attempt:
+  (1) do **not** zero BITE_TIME (`0xBF100214`) — a `0` compare makes `CUR_TIME ≥ 0`
+  always true, *causing* a bite; (2) issue a **DSB** after the MMIO write and make sure
+  it runs once the peripheral aperture is live. With `CTRL = 0` (and BITE_TIME left
+  high), a clean-jump hang now stays dark **indefinitely** — confirmed past 4 minutes,
+  no self-reboot. openiboot now runs deterministically on a clean handoff.
 
 ### 3. The handoff explains the rest
 
@@ -118,7 +126,7 @@ which is CPU-state-independent — hence the continuing ~2-min reboot.)
 | relocation + entry → C | ✅ works |
 | `platform_init()` (with uart/spi skipped) | ✅ completes |
 | `uart_setup` / `spi_setup` | 🩹 reset on stale constants — skipped |
-| hardware watchdog (~2 min) | ❌ not yet disabled |
+| hardware watchdog (~2 min) | ✅ disabled (WD1_CTRL `0xBF10021C` = 0) — runs indefinitely |
 | display / pixel output | ❌ needs full LCD bring-up (display off after sleep handoff) |
 | boot to console | ❌ not yet |
 

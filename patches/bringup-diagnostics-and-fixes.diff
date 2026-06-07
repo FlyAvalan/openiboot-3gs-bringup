@@ -1,8 +1,8 @@
 diff --git a/arch-arm/entry.sx b/arch-arm/entry.sx
-index 6f683b6..df15e33 100644
+index 6f683b6..893a845 100644
 --- a/arch-arm/entry.sx
 +++ b/arch-arm/entry.sx
-@@ -42,6 +42,52 @@ _start:
+@@ -42,6 +42,59 @@ _start:
  .code 32
  ArmReset:						// This function will setup the processor and kick off execution
  
@@ -39,22 +39,53 @@ index 6f683b6..df15e33 100644
 +	MCR	p15, 0, R0, c7, c10, 4			// DSB
 +	MCR	p15, 0, R0, c7, c5, 4			// ISB (prefetch flush)
 +
-+	// 4. DISARM the S5L8920 hardware watchdog that iBoot left armed across the
-+	//    kloader sleep/wake handoff. openiboot's own Reboot/DebugReboot FIRE a reset
-+	//    via 0xBF100214=1, 0xBF100210=0x80000000, 0xBF10021C=4; we DISARM by zeroing
-+	//    enable/count/control. MMU is now OFF, so these are correct physical writes.
++	// 4. DISARM the Apple "WD1" SoC watchdog iBoot armed (~120s BITE_TIME) and that
++	//    openiboot never services -> ~2min self-reboot. Apple WDx group (base
++	//    0xBF100200): +0x10 CUR_TIME, +0x14 BITE_TIME, +0x1C CTRL (RESET_EN=bit2).
++	//    Reset fires iff RESET_EN set AND CUR_TIME>=BITE_TIME. Canonical disable
++	//    (Linux apple_wdt_stop) = clear RESET_EN via CTRL=0. Do NOT zero BITE_TIME
++	//    (a 0 compare makes CUR_TIME>=0 always true); set it high as insurance.
++	//    Clear WD0/WD1/WD2 control mirrors. MMU is OFF so these are direct MMIO.
 +	//    R0 is still 0 from the cache ops above.
-+	LDR	R1, =0xBF10021C
-+	STR	R0, [R1]				// control/commit = 0
-+	LDR	R1, =0xBF100214
-+	STR	R0, [R1]				// enable = 0
-+	LDR	R1, =0xBF100210
-+	STR	R0, [R1]				// count/timeout = 0
++	LDR	R1, =0xBF10020C				// WD0_CTRL = 0
++	STR	R0, [R1]
++	LDR	R1, =0xBF10021C				// WD1_CTRL = 0 (clear RESET_EN)
++	STR	R0, [R1]
++	LDR	R1, =0xBF10022C				// WD2_CTRL = 0
++	STR	R0, [R1]
++	MVN	R2, #0					// 0xFFFFFFFF
++	LDR	R1, =0xBF100214				// WD1_BITE_TIME = max (NOT zero)
++	STR	R2, [R1]
++	MCR	p15, 0, R0, c7, c10, 4			// DSB - ensure WDT writes retire
 +	// === END ROBUST ENTRY SHIM ===
 +
  	MOV	R0, PC
  	LDR	R1, =ArmResetDifferenceFromEntry
  	SUB	R0, R0,	R1
+@@ -85,11 +138,22 @@ ArmReset:						// This function will setup the processor and kick off execution
+ 	// There's no peripheral remap register. Need to change the base addresses for each A4 device.
+ 	// If you find it though, feel free to fix it.
+ 
+-	LDR	R1, =0xBF100000				// MIU register	
++	LDR	R1, =0xBF100000				// MIU register
+ 	LDR	R2, [R1]				// Get current settings
+ 	BIC	R2, R2, #3				// Mask out current MIU setting
+ 	ORR	R2, R2, #2				// Change setting so 0x0 is physical memory
+ 	STR	R2, [R1]				// Set MIU settings
++
++	// Re-disarm the WD1 watchdog now that the MIU aperture is set, in case the
++	// shim's writes (above) raced the aperture. Preserve R0 = relocation source.
++	MOV	R3, #0
++	LDR	R1, =0xBF10021C				// WD1_CTRL = 0 (clear RESET_EN)
++	STR	R3, [R1]
++	LDR	R1, =0xBF10020C				// WD0_CTRL = 0
++	STR	R3, [R1]
++	LDR	R1, =0xBF10022C				// WD2_CTRL = 0
++	STR	R3, [R1]
++	MCR	p15, 0, R3, c7, c10, 4			// DSB
+ #endif
+ 
+ 	LDR	R1, =_start				// OMG, we're not in the right place! Copy us to the right place
 diff --git a/init.c b/init.c
 index baed83d..94c8838 100644
 --- a/init.c
